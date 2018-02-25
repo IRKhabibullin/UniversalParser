@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import re
+from urllib.parse import urlparse
 
 import requests
 from lxml import etree
@@ -8,10 +9,14 @@ from lxml import etree
 from lxml.html.clean import Cleaner
 
 line_len = 80
-stopwords = ['adv', 'comment', 'rule', 'footer', 'info', 'bar', 'nav', 'tag',
-             'tabl', 'menu', 'login', 'sign', 'photo', 'side', 'other']
-good_words = ['article', 'body', 'topic', 'content', 'story', 'post']
-cleaner = Cleaner(style=True, links=False, meta=False)
+stopwords = ['adv', 'rule', 'footer', 'info', 'sidebar', 'nav', 'tabl', 'menu',
+             'favorite', 'login', 'sign', 'other', 'board', 'social', 'relat',
+             'rating', 'ban', 'categor', 'more', 'top-bar', 'panel',
+             'headline',
+             # weak stopwords
+             'tag', 'photo', 'add', 'title', 'sub', 'right', 'comment']
+# good_words = ['article', 'body', 'topic', 'content', 'story', 'post']
+cleaner = Cleaner(links=False, style=True, inline_style=False)
 
 
 def get_title(html):
@@ -34,12 +39,15 @@ def get_title(html):
 
 
 def parse(url):
-    response = etree.HTML(requests.get(url).text)
-    page_title = get_title(response)
-    ps = response.xpath('//p|//h1')
+    html_text = requests.get(url).text
+    page_title = get_title(etree.HTML(html_text))
+    response = etree.HTML(cleaner.clean_html(html_text))
+    article = response.xpath('//article')
+    if article:
+        print('article')
+        response = article[0]
+    ps = response.xpath('//p|//h1|//div')
     ps = filter_elements(ps)
-    if url == urls[2]:
-        print('asd')
     paragraphs = []
     for p in ps:
         # paragraph_text = ''
@@ -65,7 +73,10 @@ def parse(url):
         #     if t is not None:
         #         paragraph_text += ' ' + t.strip()
         # paragraphs.append(paragraph_text)
-        paragraphs.append(get_deep_text(p))
+        if is_valid(p, True):
+            t = get_text(p, ps, True)
+            if t:
+                paragraphs.append(t)
     return page_title, paragraphs
 
 
@@ -76,7 +87,7 @@ def filter_elements(elements):
         if parent is not None:
             if parent.tag not in ['div', 'h1', 'h2', 'p']:
                 continue
-        if not valid_tag(element):
+        if not is_valid(element, True):
             continue
         filtered.append(element)
     print('{} elements filtered to {}'.format(len(elements), len(filtered)))
@@ -85,7 +96,7 @@ def filter_elements(elements):
 
 def format_article(title, ps):
     formatted_article = split_by_len(title)
-    formatted_article.append('\n\n')
+    formatted_article.append('\n')
     for p in ps:
         formatted_article += split_by_len(p)
         formatted_article.append('')
@@ -94,14 +105,23 @@ def format_article(title, ps):
 
 
 def split_by_len(text):
-    words = text.split()
+    words = text.split(' ')
     formatted_text = []
     line = ''
     for word in words:
+        if not word:
+            continue
+        is_new_line = False
         if len(word) > 400:
             word = '[очень_длинная_ссылка]'
+        try:
+            if word[-1] == '\n':
+                word = word.strip('\n')
+                is_new_line = True
+        except IndexError:
+            print('index error', '|' + word + '|')
         if len(line) + len(word) <= line_len - 1:
-            line += ' ' + word if line else word
+            line += (' ' if line else '') + word
         else:
             if len(word) >= line_len:
                 divided, line = split_large_word(line, word)
@@ -109,6 +129,9 @@ def split_by_len(text):
             else:
                 formatted_text.append(line)
                 line = word
+        if is_new_line:
+            formatted_text.append(line)
+            line = ''
     if line:
         formatted_text.append(line)
     return formatted_text
@@ -133,8 +156,7 @@ def split_large_word(line, word):
     return divided_word, line
 
 
-def valid_tag(element):
-    # like check for display:none and stuff
+def is_valid(element, deep=False):
     try:
         if 'display:none' in element.attrib['style'] or \
                         'display: none' in element.attrib['style']:
@@ -147,11 +169,17 @@ def valid_tag(element):
     except KeyError:
         pass
     try:
-        parent = element.getparent()
-        if parent is not None:
-            return valid_tag(parent)
+        if any(kw in element.attrib['id'] for kw in stopwords):
+            return False
     except KeyError:
         pass
+    if deep:
+        try:
+            parent = element.getparent()
+            if parent is not None:
+                return is_valid(parent, True)
+        except KeyError:
+            pass
     return True
 
 
@@ -163,10 +191,14 @@ def check_url(url):
     return True
 
 
-def get_deep_text(element):
+def get_text(element, page_elements, deep=False):
     text = ''
-    if element.text is not None:
-        text += ' ' + element.text.strip()
+    try:
+        e_text = element.text.strip().replace('\n', ' ')
+        if e_text:
+            text += ' ' + e_text
+    except AttributeError:
+        pass
     if element.tag == 'a':
         try:
             a_url = element.attrib['href']
@@ -174,17 +206,33 @@ def get_deep_text(element):
                 text += ' [' + a_url + ']'
         except KeyError:
             print('href error:', element.attrib)
-    for child in element.getchildren():
-        text += get_deep_text(child)
+    if deep:
+        for child in element.getchildren():
+            if child.tag != 'div' and is_valid(child, False):
+                if child not in page_elements:
+                    text += get_text(child, page_elements, True)
     if element.tag == 'br':
         text += '\n'
-    if element.tail is not None:
-        text += ' ' + element.tail.strip()
+    try:
+        e_tail = element.tail.strip().replace('\n', ' ')
+        if e_tail:
+            text += ' ' + e_tail
+    except AttributeError:
+        pass
     return text
+
+
+def save_article(url, article):
+    parsed = urlparse(url)
+    print(parsed)
+    print(parsed.geturl())
+    print(parsed.hostname)
+
 
 if __name__ == '__main__':
     responses = []
-    urls = ['https://lenta.ru/news/2018/02/17/loto/',
+    urls = [
+            'https://lenta.ru/news/2018/02/17/loto/',
             'https://pikabu.ru/story/makhnemsya_ne_glyadya_5716361',
             'https://www.gazeta.ru/culture/photo/glavnoi_blondinke_37.shtml',
             'https://habrahabr.ru/sandbox/27705/',
@@ -193,44 +241,10 @@ if __name__ == '__main__':
             'https://macos.livejournal.com/1673260.html?media',
             'https://www.kinopoisk.ru/news/3117842/',
             'https://ria.ru/world/20180217/1514828882.html',
-            'https://news.mail.ru/society/32594072/?frommail=1']
-    for url in urls:
-        print(url)
-        for l in format_article(*parse(url)):
-            print(l)
-    # html_page = etree.HTML(requests.get(urls[3]).text)
-    # divs = html_page.xpath('//div')
-    # for d in divs:
-    #     try:
-    #         if d.attrib['class'] == 'post__text post__text-html js-mediator-article':
-    #             get_deep_text(d)
-    #     except Exception:
-    #         pass
-            # title_tags = ['h1', 'h2', 'a']
-            # _titles = []
-            # for r in urls:
-            #     _titles.append(parse(r))
-
-            # for url in urls:
-            #     page_html = requests.get(url).text
-            #     page_html = cleaner.clean_html(page_html)
-            #     responses.append(etree.HTML(page_html))
-            # page_titles = [[title.text for title in titles] for titles in
-            #                [r.xpath('//title') for r in responses]]
-            # ps = [r.xpath('//p|//a') for r in responses]
-            # ps = [[p for p in p_list if p.getparent().tag in []] for p_list in ps]
-
-            # no p: 2, 3
-            # article_titles = [[r.xpath('//' + tag) for tag in title_tags] for r in
-            #                   responses]
-            # article_titles_flat = []
-            # for article in article_titles:
-            #     article_titles_flat.append(
-            #         [item.text for sublist in article for item in sublist if
-            #          item.text is not None])
-            # probable_titles = []
-            # for i in range(len(page_titles)):
-            #     probable_titles.append([h for h in article_titles_flat[i] if
-            #                             h in page_titles[i][0]])
-            # # s.encode('raw-unicode-escape')
-    print('oaed')
+            'https://news.mail.ru/society/32594072/?frommail=1'
+    ]
+    # for url in urls:
+    #     print(url)
+    #     for l in format_article(*parse(url)):
+    #         print(l)
+    save_article(urls[2], format_article(*parse(urls[0])))
